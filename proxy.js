@@ -4,7 +4,7 @@ const chromium = require('@sparticuz/chromium');
 const { spawn } = require('child_process');
 const http = require('http');
 
-const PORT = 8888;
+const PORT = process.env.PORT || 8888;
 const TARGET_URL = process.env.PROXY_TARGET_URL || 'https://sudamericaplay2.com/canal_8112/cza_dsports.html';
 const VIEWPORT_WIDTH = 1280;
 const VIEWPORT_HEIGHT = 720;
