@@ -1,6 +1,16 @@
 {
   "name": "selfbot-mundialito",
   "version": "1.0.0",
+  "description": "Selfbot con streaming y puppeteer para Render",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "postinstall": "npx puppeteer browsers install chrome"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
     "dotenv": "^16.4.7",
     "discord.js-selfbot-youtsuho-v13": "^1.0.0",
