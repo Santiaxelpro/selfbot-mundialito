@@ -13,7 +13,7 @@
   },
   "dependencies": {
     "dotenv": "^16.4.7",
-    "discord.js-selfbot-youtsuho-v13": "latest"
+    "discord.js-selfbot-youtsuho-v13": "latest",
     "@dank074/discord-video-stream": "latest",
     "puppeteer": "^23.11.1"
   }
