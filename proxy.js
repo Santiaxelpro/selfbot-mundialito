@@ -1,5 +1,6 @@
 require('dotenv').config();
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-core');
+const chromium = require('@sparticuz/chromium');
 const { spawn } = require('child_process');
 const http = require('http');
 
@@ -225,35 +226,39 @@ async function startBrowser() {
     console.log(`URL: ${TARGET_URL}`);
 
     try {
-        browser = await puppeteer.launch({
-            headless: 'new',
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-gpu',
-                '--disable-dev-shm-usage',
-                '--disable-extensions',
-                '--disable-background-networking',
-                '--disable-sync',
-                '--disable-translate',
-                '--disable-features=TranslateUI,PreloadMediaEngagementData,MediaEngagementBypassAutoplayPolicies',
-                '--autoplay-policy=no-user-gesture-required',
-                `--window-size=${VIEWPORT_WIDTH},${VIEWPORT_HEIGHT}`,
-                '--hide-scrollbars',
-                '--no-first-run',
-                '--no-default-browser-check',
-                '--disable-renderer-backgrounding',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-ipc-flooding-protection',
-                '--memory-pressure-off',
-                '--enable-features=NetworkService,NetworkServiceInProcess',
-                '--force-color-profile=srgb',
-                '--disable-logging',
-                '--log-level=3',
-                '--silent'
-            ]
-        });
+       browser = await puppeteer.launch({
+    // Usa chromium para obtener la ruta y argumentos base
+    executablePath: await chromium.executablePath(),
+    args: [
+        ...chromium.args,  // <-- incluye los argumentos base recomendados
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-gpu',
+        '--disable-dev-shm-usage',
+        '--disable-extensions',
+        '--disable-background-networking',
+        '--disable-sync',
+        '--disable-translate',
+        '--disable-features=TranslateUI,PreloadMediaEngagementData,MediaEngagementBypassAutoplayPolicies',
+        '--autoplay-policy=no-user-gesture-required',
+        `--window-size=${VIEWPORT_WIDTH},${VIEWPORT_HEIGHT}`,
+        '--hide-scrollbars',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-renderer-backgrounding',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-ipc-flooding-protection',
+        '--memory-pressure-off',
+        '--enable-features=NetworkService,NetworkServiceInProcess',
+        '--force-color-profile=srgb',
+        '--disable-logging',
+        '--log-level=3',
+        '--silent'
+    ],
+    headless: chromium.headless,  // o 'new' si prefieres
+    defaultViewport: chromium.defaultViewport,
+});
         browserConnected = true;
 
         const page = await browser.newPage();
