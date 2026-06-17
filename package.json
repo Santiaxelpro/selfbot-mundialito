@@ -1,0 +1,10 @@
+{
+  "name": "selfbot-mundialito",
+  "version": "1.0.0",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "discord.js-selfbot-youtsuho-v13": "^1.0.0",
+    "@dank074/discord-video-stream": "^1.0.0",
+    "puppeteer": "^23.11.1"
+  }
+}
