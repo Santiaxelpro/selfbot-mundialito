@@ -5,16 +5,16 @@
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js",
-    "postinstall": "npx puppeteer browsers install chrome"
+    "start": "node index.js"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.18.0"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
     "discord.js-selfbot-youtsuho-v13": "latest",
     "@dank074/discord-video-stream": "latest",
-    "puppeteer": "^23.11.1"
+    "puppeteer-core": "^23.11.1",
+    "@sparticuz/chromium": "^123.0.0"
   }
 }
