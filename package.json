@@ -15,6 +15,7 @@
     "discord.js-selfbot-youtsuho-v13": "latest",
     "@dank074/discord-video-stream": "latest",
     "puppeteer-core": "^23.11.1",
-    "@sparticuz/chromium": "^123.0.0"
+    "@sparticuz/chromium": "^123.0.0",
+    "express": "latest"
   }
 }
