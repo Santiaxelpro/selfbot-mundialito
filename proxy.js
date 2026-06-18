@@ -4,11 +4,10 @@ const chromium = require('@sparticuz/chromium');
 const { spawn } = require('child_process');
 const http = require('http');
 
-// === CONFIGURACIÓN OPTIMIZADA (ajustable por variables de entorno) ===
+// === CONFIGURACIÓN ===
 const PORT = process.env.PORT || 8888;
 const TARGET_URL = process.env.PROXY_TARGET_URL || 'https://sudamericaplay2.com/canal_8112/cza_dsports.html';
 
-// Parámetros de calidad/rendimiento
 const VIEWPORT_WIDTH  = parseInt(process.env.VIDEO_WIDTH)  || 640;
 const VIEWPORT_HEIGHT = parseInt(process.env.VIDEO_HEIGHT) || 360;
 const FPS             = parseInt(process.env.FPS)          || 15;
@@ -18,31 +17,38 @@ const VIDEO_TUNE      = process.env.VIDEO_TUNE     || 'zerolatency';
 const SCREENCAST_QUAL = parseInt(process.env.SCREENCAST_QUALITY) || 70;
 const AUDIO_ENABLED   = process.env.AUDIO_ENABLED === 'true';
 
-// Menos frames capturados para alinear con FPS bajo (cada 2 frames si FPS <= 15)
 const EVERY_NTH_FRAME = FPS <= 15 ? 2 : 1;
-
-// Audio reducido o desactivado
-const AUDIO_SAMPLE_RATE = AUDIO_ENABLED ? 22050 : 8000; // Si está desactivado, se usa un sample rate bajo (no se usa realmente)
+const AUDIO_SAMPLE_RATE = 22050;
 const AUDIO_CHANNELS   = 2;
 const AUDIO_BITRATE    = '64k';
 
-// Tiempos
 const RECONNECT_DELAY_MS = 10000;
 const FFMPEG_RESTART_DELAY_MS = 3000;
 
-// === ESTADO GLOBAL ===
+// === ESTADO ===
 let clients = new Set();
 let ffmpeg = null;
 let browser = null;
 let cdpSession = null;
 let browserConnected = false;
+let browserStarting = false;    // evita llamadas concurrentes
 let audioBuffer = [];
 let hasAudio = false;
 let audioFeedInterval = null;
 let shutdownInProgress = false;
 let statsInterval = null;
+let bitrateLogCounter = 0;
 
-// === FUNCIONES DE AUDIO (solo si está habilitado) ===
+// === MANEJADORES DE ERRORES GLOBALES ===
+process.on('uncaughtException', (err) => {
+    console.error('❌ Excepción no capturada:', err.message);
+    // No salimos, solo registramos
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('❌ Promesa rechazada no manejada:', reason);
+});
+
+// === FUNCIONES DE AUDIO ===
 function floatsToPCM(floats) {
     const buf = Buffer.allocUnsafe(floats.length * 2);
     for (let i = 0; i < floats.length; i++) {
@@ -54,10 +60,9 @@ function floatsToPCM(floats) {
 
 function startFFmpeg() {
     if (shutdownInProgress || !cdpSession) return;
-
     if (ffmpeg) {
-        ffmpeg.kill();
-        ffmpeg = null;
+        // Si ya existe, no lo reiniciamos
+        return;
     }
 
     console.log(`FFmpeg: ${VIEWPORT_WIDTH}x${VIEWPORT_HEIGHT} @ ${FPS}fps | ${VIDEO_BITRATE} ${VIDEO_PRESET}/${VIDEO_TUNE}`);
@@ -77,25 +82,24 @@ function startFFmpeg() {
         '-g', String(FPS * 2),
         '-keyint_min', String(FPS),
         '-sc_threshold', '40',
-        '-refs', '1',               // menos referencias = menos CPU
-        '-bf', '0',                 // sin B-frames para menor latencia y CPU
+        '-refs', '1',
+        '-bf', '0',
         '-s', `${VIEWPORT_WIDTH}x${VIEWPORT_HEIGHT}`,
         '-r', String(FPS),
         '-f', 'mpegts',
         '-muxdelay', '0',
-        '-threads', '1',            // un solo hilo para reducir uso de CPU
+        '-threads', '1',
         'pipe:1'
     ];
 
-    // Si audio está habilitado, añadimos entrada de audio
     if (AUDIO_ENABLED) {
-        args.splice(4, 0, 
+        args.splice(4, 0,
             '-f', 's16le',
             '-ar', String(AUDIO_SAMPLE_RATE),
             '-ac', String(AUDIO_CHANNELS),
             '-i', 'pipe:3'
         );
-        args.splice(12, 0, 
+        args.splice(12, 0,
             '-c:a', 'aac',
             '-b:a', AUDIO_BITRATE,
             '-ar', String(AUDIO_SAMPLE_RATE),
@@ -107,22 +111,30 @@ function startFFmpeg() {
 
     ffmpeg.stdout.on('data', (data) => {
         if (clients.size === 0) return;
+        // Enviar a todos los clientes activos
         for (const client of clients) {
-            if (!client.destroyed) {
-                client.write(data);
+            if (!client.destroyed && client.writable) {
+                try {
+                    client.write(data);
+                } catch (err) {
+                    // Si falla, lo eliminamos de la lista
+                    clients.delete(client);
+                    console.log('Cliente eliminado por error de escritura');
+                }
+            } else {
+                clients.delete(client);
             }
         }
     });
 
     ffmpeg.stderr.on('data', (data) => {
         const msg = data.toString();
-        if (msg.includes('bitrate=')) {
+        if (msg.includes('bitrate=') && bitrateLogCounter++ % 10 === 0) {
             const match = msg.match(/bitrate=\s*(\d+(?:\.\d+)?)\s*kbits\/s/);
             if (match) {
                 console.log(`Bitrate: ${match[1]} kbps | Clientes: ${clients.size}`);
             }
         }
-        // No mostramos logs de error para no saturar
     });
 
     ffmpeg.on('exit', (code) => {
@@ -149,23 +161,24 @@ function startFFmpeg() {
         }
     });
 
-    // Si audio está habilitado, configuramos el envío periódico
     if (AUDIO_ENABLED) {
         audioFeedInterval = setInterval(() => {
             if (!ffmpeg || !ffmpeg.stdio[3] || ffmpeg.stdio[3].destroyed) return;
             try {
                 if (audioBuffer.length > 0) {
                     const chunk = Buffer.concat(audioBuffer.splice(0, audioBuffer.length));
-                    ffmpeg.stdio[3].write(chunk);
+                    if (ffmpeg.stdio[3].writable) {
+                        ffmpeg.stdio[3].write(chunk);
+                    }
                 } else if (!hasAudio) {
                     const samplesPerFrame = Math.floor(AUDIO_SAMPLE_RATE / FPS);
                     const silence = Buffer.alloc(samplesPerFrame * 2 * AUDIO_CHANNELS);
-                    ffmpeg.stdio[3].write(silence);
+                    if (ffmpeg.stdio[3].writable) {
+                        ffmpeg.stdio[3].write(silence);
+                    }
                 }
             } catch (_) {}
         }, 1000 / FPS);
-    } else {
-        // Si no hay audio, no usamos pipe:3, lo ignoramos
     }
 }
 
@@ -179,18 +192,16 @@ async function setupAudioCapture(page) {
             }
             const buf = floatsToPCM(data);
             audioBuffer.push(buf);
-            // Limitar buffer para evitar crecimiento excesivo
             if (audioBuffer.length > 20) audioBuffer.shift();
         });
 
         const result = await page.evaluate(() => {
             const video = document.querySelector('video');
             if (!video) return false;
-
             try {
                 const ctx = new AudioContext({ sampleRate: 22050 });
                 const source = ctx.createMediaElementSource(video);
-                const processor = ctx.createScriptProcessor(4096, 2, 2); // buffer más grande = menos llamadas
+                const processor = ctx.createScriptProcessor(4096, 2, 2);
                 processor.onaudioprocess = (e) => {
                     const left = e.inputBuffer.getChannelData(0);
                     const right = e.inputBuffer.getChannelData(1);
@@ -231,7 +242,8 @@ function setupVideoMuteOverride(page) {
 }
 
 async function startBrowser() {
-    if (browserConnected || shutdownInProgress) return;
+    if (browserStarting || browserConnected || shutdownInProgress) return;
+    browserStarting = true;
 
     console.log(`Navegador: ${VIEWPORT_WIDTH}x${VIEWPORT_HEIGHT} | FPS: ${FPS}`);
     console.log(`URL: ${TARGET_URL}`);
@@ -268,10 +280,10 @@ async function startBrowser() {
                 '--disable-accelerated-2d-canvas',
                 '--disable-canvas-aa',
                 '--disable-software-rasterizer',
-                '--js-flags="--max-old-space-size=256"',  // límite de memoria V8
-                '--single-process'                        // reduce procesos (memoria) a costa de estabilidad, pero necesario
+                '--js-flags="--max-old-space-size=384"',
+                '--single-process'
             ],
-            headless: 'new',  // más ligero
+            headless: 'new',
             defaultViewport: {
                 width: VIEWPORT_WIDTH,
                 height: VIEWPORT_HEIGHT,
@@ -279,6 +291,7 @@ async function startBrowser() {
         });
 
         browserConnected = true;
+        browserStarting = false;
 
         const page = await browser.newPage();
         await page.setViewport({ width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT });
@@ -319,7 +332,11 @@ async function startBrowser() {
 
         cdpSession.on('Page.screencastFrame', ({ data, sessionId }) => {
             if (ffmpeg && ffmpeg.stdin && ffmpeg.stdin.writable) {
-                ffmpeg.stdin.write(Buffer.from(data, 'base64'));
+                try {
+                    ffmpeg.stdin.write(Buffer.from(data, 'base64'));
+                } catch (err) {
+                    // Si falla, ignoramos y reiniciaremos FFmpeg si es necesario
+                }
             }
             cdpSession.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
         });
@@ -349,6 +366,7 @@ async function startBrowser() {
     } catch (err) {
         console.error(`Navegador: ${err.message}`);
         browserConnected = false;
+        browserStarting = false;
         cdpSession = null;
         hasAudio = false;
         if (clients.size > 0 && !shutdownInProgress) {
@@ -370,6 +388,7 @@ async function stopBrowser() {
         await browser.close().catch(() => {});
     }
     browserConnected = false;
+    browserStarting = false;
     cdpSession = null;
     hasAudio = false;
     audioBuffer = [];
@@ -387,11 +406,30 @@ const server = http.createServer((req, res) => {
         });
         res.socket.setNoDelay(true);
         if (typeof res.socket.setSendBufferSize === 'function') {
-            res.socket.setSendBufferSize(128 * 1024); // buffer más pequeño
+            res.socket.setSendBufferSize(128 * 1024);
         }
+
+        // Manejar errores del cliente para evitar EPIPE
+        res.on('error', (err) => {
+            if (err.code === 'EPIPE') {
+                // Cliente desconectado, lo eliminamos
+                clients.delete(res);
+            }
+        });
+        res.socket.on('error', (err) => {
+            if (err.code === 'EPIPE') {
+                clients.delete(res);
+            }
+        });
+
         clients.add(res);
-        if (!browserConnected) startBrowser();
-        else if (!ffmpeg) startFFmpeg();
+
+        if (!browserConnected && !browserStarting) {
+            startBrowser();
+        } else if (browserConnected && !ffmpeg) {
+            startFFmpeg();
+        }
+
         req.on('close', () => {
             clients.delete(res);
             console.log(`Cliente desconectado (${clients.size} restantes)`);
@@ -406,7 +444,7 @@ const server = http.createServer((req, res) => {
     }
 });
 
-// === APAGADO GRACIELSO ===
+// === APAGADO ===
 async function shutdown() {
     if (shutdownInProgress) return;
     shutdownInProgress = true;
@@ -428,8 +466,8 @@ server.listen(PORT, () => {
     console.log(`Proxy: http://localhost:${PORT}/stream`);
     console.log(`Config: ${VIEWPORT_WIDTH}x${VIEWPORT_HEIGHT} @ ${FPS}fps | ${VIDEO_BITRATE} ${VIDEO_PRESET}/${VIDEO_TUNE}`);
     console.log(`Audio: ${AUDIO_ENABLED ? 'Habilitado' : 'Desactivado'}`);
-    console.log(`Memoria límite V8: 256MB | Chromium args optimizados`);
-    // Estadísticas cada 30 segundos
+    console.log(`Memoria límite V8: 384MB | Single-process mode`);
+
     statsInterval = setInterval(() => {
         const mem = process.memoryUsage();
         console.log(`📊 Memoria: RSS=${Math.round(mem.rss/1024/1024)}MB | Heap=${Math.round(mem.heapUsed/1024/1024)}MB/${Math.round(mem.heapTotal/1024/1024)}MB`);
