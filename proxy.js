@@ -5,27 +5,24 @@ const puppeteer = require('puppeteer-core');
 const chromium = require('@sparticuz/chromium');
 const { spawn } = require('child_process');
 const { URL } = require('url');
-const fs = require('fs');
+const { PassThrough } = require('stream');
 
-// ========= CONFIGURACIÓN =========
 const PORT = process.env.PORT || 25553;
 const TARGET_PAGE = process.env.PROXY_TARGET_URL || 'https://tvtvhd.com/tv/canales.php?stream=dsports';
+const MANIFEST_REFRESH_SEC = 10;
+const TOKEN_RENEW_SEC = 300;
 
-const MANIFEST_REFRESH_SEC = 10;      // Actualizar manifiesto cada 10s
-const TOKEN_RENEW_SEC = 300;          // Renovar token cada 5 min
-
-// ========= ESTADO GLOBAL =========
-let m3u8Url = null;                   // URL del .m3u8 con token
-let manifestContent = null;           // Manifiesto reescrito
+let m3u8Url = null;
+let manifestContent = null;
 let originBaseUrl = null;
 let lastTokenRenew = 0;
 let isRenewing = false;
-let currentStreamProcess = null;      // Proceso FFmpeg para /stream
-let streamClients = 0;                // Contador de clientes conectados al stream
+let activeFFmpeg = null;
+let globalStream = new PassThrough();
+let streamClients = 0;
 
-// ========= HEADERS =========
 const REQUEST_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Referer': 'https://tvtvhd.com/',
     'Origin': 'https://tvtvhd.com',
     'Accept': '*/*',
@@ -33,33 +30,21 @@ const REQUEST_HEADERS = {
     'Connection': 'keep-alive'
 };
 
-// ========= RENOVAR TOKEN CON PUPPETEER =========
 async function renewToken() {
     if (isRenewing) return;
     isRenewing = true;
-    console.log('🔄 Renovando token desde la página web...');
+    console.log('🔄 Renovando token...');
     let browser = null;
     try {
         const executablePath = await chromium.executablePath();
         browser = await puppeteer.launch({
             executablePath,
-            args: [
-                ...chromium.args,
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-gpu',
-                '--disable-dev-shm-usage',
-                '--ignore-certificate-errors',
-                '--disable-web-security',
-                '--allow-running-insecure-content'
-            ],
+            args: [...chromium.args, '--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu', '--disable-dev-shm-usage'],
             headless: chromium.headless,
             defaultViewport: chromium.defaultViewport,
         });
-
         const page = await browser.newPage();
         let capturedUrl = null;
-
         await page.setRequestInterception(true);
         page.on('request', (req) => {
             const url = req.url();
@@ -69,10 +54,8 @@ async function renewToken() {
             }
             req.continue();
         });
-
         await page.goto(TARGET_PAGE, { waitUntil: 'networkidle2', timeout: 60000 });
         await new Promise(resolve => setTimeout(resolve, 5000));
-
         if (!capturedUrl) {
             capturedUrl = await page.evaluate(() => {
                 const video = document.querySelector('video');
@@ -87,14 +70,11 @@ async function renewToken() {
                 return null;
             });
         }
-
         if (capturedUrl) {
             m3u8Url = capturedUrl;
             lastTokenRenew = Date.now();
-            console.log(`✅ Token renovado: ${m3u8Url}`);
             await fetchAndRewriteManifest();
-            // Reiniciar el stream si hay clientes
-            restartStreamProcess();
+            restartFFmpeg();
         } else {
             console.error('❌ No se pudo obtener URL del M3U8');
         }
@@ -106,29 +86,15 @@ async function renewToken() {
     }
 }
 
-// ========= OBTENER Y REESCRIBIR MANIFIESTO =========
 async function fetchAndRewriteManifest() {
-    if (!m3u8Url) {
-        await renewToken();
-        return;
-    }
+    if (!m3u8Url) { await renewToken(); return; }
     try {
-        const response = await axios.get(m3u8Url, {
-            timeout: 15000,
-            responseType: 'text',
-            headers: REQUEST_HEADERS
-        });
-        if (response.status === 403) {
-            console.log('⚠️ Token expirado (403), renovando...');
-            await renewToken();
-            return;
-        }
+        const response = await axios.get(m3u8Url, { timeout: 15000, responseType: 'text', headers: REQUEST_HEADERS });
+        if (response.status === 403) { console.log('⚠️ Token expirado'); await renewToken(); return; }
         if (response.status !== 200) throw new Error(`Status ${response.status}`);
-
         const rawContent = response.data;
         const parsed = new URL(m3u8Url);
         originBaseUrl = `${parsed.protocol}//${parsed.host}${parsed.pathname.substring(0, parsed.pathname.lastIndexOf('/') + 1)}`;
-
         const lines = rawContent.split('\n');
         const rewritten = lines.map(line => {
             if (line.trim() && !line.startsWith('#') && line.includes('.ts')) {
@@ -137,7 +103,6 @@ async function fetchAndRewriteManifest() {
             }
             return line;
         });
-
         manifestContent = rewritten.join('\n');
         console.log(`✅ Manifiesto actualizado (${rewritten.filter(l => l.startsWith('/segment')).length} segmentos)`);
     } catch (error) {
@@ -146,113 +111,86 @@ async function fetchAndRewriteManifest() {
     }
 }
 
-// ========= INICIAR PROCESO FFMPEG PARA STREAM CONTINUO =========
-function startStreamProcess() {
-    if (currentStreamProcess) {
-        currentStreamProcess.kill('SIGTERM');
-        currentStreamProcess = null;
+function startFFmpeg() {
+    if (activeFFmpeg) {
+        activeFFmpeg.kill('SIGTERM');
+        activeFFmpeg = null;
     }
-
-    // Solo si hay clientes conectados o si queremos mantenerlo siempre activo
-    if (streamClients === 0) {
-        console.log('⏸️ Sin clientes, no inicio FFmpeg.');
-        return;
-    }
-
     if (!m3u8Url) {
-        console.log('⏳ Esperando token para iniciar stream...');
+        console.log('⏳ Esperando token...');
+        setTimeout(() => startFFmpeg(), 2000);
         return;
     }
-
-    console.log('🎥 Iniciando proceso FFmpeg para stream continuo...');
+    console.log('🎥 Iniciando FFmpeg...');
     const ffmpeg = spawn('ffmpeg', [
         '-re',
-        '-i', m3u8Url,               // URL del manifiesto con token
-        '-c:v', 'copy',              // Copiar video sin recodificar
-        '-c:a', 'copy',              // Copiar audio sin recodificar
-        '-f', 'mpegts',             // Salida MPEG-TS (aceptado por Discord)
-        '-mpegts_flags', 'resend_headers',
+        '-stream_loop', '-1',
+        '-i', m3u8Url,
+        '-c:v', 'libx264',
+        '-profile:v', 'baseline',
+        '-level', '3.0',
+        '-preset', 'ultrafast',
+        '-tune', 'zerolatency',
+        '-b:v', '1000k',
+        '-maxrate', '1200k',
+        '-bufsize', '2000k',
+        '-c:a', 'aac',
+        '-b:a', '64k',
+        '-f', 'mpegts',
+        '-mpegts_flags', 'resend_headers+system_b',
+        '-muxdelay', '0',
         '-flush_packets', '1',
+        '-fflags', 'nobuffer+discardcorrupt',
+        '-flags', 'low_delay',
         'pipe:1'
     ]);
-
-    ffmpeg.stderr.on('data', (data) => {
-        const msg = data.toString();
-        if (msg.includes('error') || msg.includes('Error')) {
-            console.error(`FFmpeg stderr: ${msg.trim()}`);
-        }
-    });
-
+    ffmpeg.stderr.on('data', (data) => console.error(`FFmpeg: ${data.toString().trim()}`));
     ffmpeg.on('close', (code) => {
-        console.log(`FFmpeg finalizado con código ${code}`);
-        if (code !== 0 && streamClients > 0) {
-            console.log('Reiniciando FFmpeg en 2s...');
-            setTimeout(() => startStreamProcess(), 2000);
-        }
-        currentStreamProcess = null;
+        console.log(`FFmpeg closed with code ${code}`);
+        activeFFmpeg = null;
+        // Reiniciar si hay clientes
+        if (streamClients > 0) startFFmpeg();
     });
-
-    ffmpeg.on('error', (err) => {
-        console.error('Error en FFmpeg:', err.message);
-        currentStreamProcess = null;
-    });
-
-    currentStreamProcess = ffmpeg;
+    // Conectar al stream global sin cerrarlo al final
+    ffmpeg.stdout.pipe(globalStream, { end: false });
+    activeFFmpeg = ffmpeg;
 }
 
-function restartStreamProcess() {
-    if (currentStreamProcess) {
-        currentStreamProcess.kill('SIGTERM');
-        currentStreamProcess = null;
+function restartFFmpeg() {
+    if (activeFFmpeg) {
+        activeFFmpeg.kill('SIGTERM');
+        activeFFmpeg = null;
     }
-    if (streamClients > 0) {
-        setTimeout(() => startStreamProcess(), 1000);
-    }
+    if (streamClients > 0) setTimeout(() => startFFmpeg(), 1000);
 }
 
-// ========= SERVIDOR EXPRESS =========
 const app = express();
 
-// Endpoint para obtener el manifiesto (para compatibilidad)
 app.get('/manifest', (req, res) => {
-    if (!manifestContent) {
-        return res.status(503).send('Stream no disponible aún.');
-    }
+    if (!manifestContent) return res.status(503).send('No disponible');
     res.set('Content-Type', 'application/vnd.apple.mpegurl');
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.send(manifestContent);
 });
 
-// Endpoint para servir segmentos (usado por el manifiesto)
 app.get('/segment', async (req, res) => {
     const targetUrl = req.query.url;
     if (!targetUrl) return res.status(400).send('Falta url');
     try {
-        const response = await axios({
-            method: 'get',
-            url: targetUrl,
-            responseType: 'stream',
-            timeout: 30000,
-            headers: REQUEST_HEADERS
-        });
+        const response = await axios({ method: 'get', url: targetUrl, responseType: 'stream', timeout: 30000, headers: REQUEST_HEADERS });
         res.set('Content-Type', response.headers['content-type'] || 'video/mp2t');
         res.set('Access-Control-Allow-Origin', '*');
         res.set('Cache-Control', 'no-cache');
         response.data.pipe(res);
     } catch (error) {
         console.error(`❌ Error al servir segmento: ${error.message}`);
-        if (!res.headersSent) res.status(500).send('Error al obtener segmento');
+        if (!res.headersSent) res.status(500).send('Error');
     }
 });
 
-// **NUEVO: Endpoint para el flujo continuo MPEG-TS**
 app.get('/stream', (req, res) => {
-    if (!m3u8Url) {
-        return res.status(503).send('Token aún no disponible. Espere unos segundos.');
-    }
-
-    // Configurar headers para streaming
+    if (!m3u8Url) return res.status(503).send('Token no disponible');
     res.set({
         'Content-Type': 'video/MP2T',
         'Transfer-Encoding': 'chunked',
@@ -260,34 +198,22 @@ app.get('/stream', (req, res) => {
         'Access-Control-Allow-Origin': '*',
         'Connection': 'keep-alive'
     });
-
     streamClients++;
-    console.log(`📡 Nuevo cliente conectado al stream (${streamClients} totales)`);
-
-    // Si no hay proceso FFmpeg, iniciarlo
-    if (!currentStreamProcess) {
-        startStreamProcess();
-    }
-
-    // Pipe de la salida de FFmpeg al cliente
-    if (currentStreamProcess) {
-        currentStreamProcess.stdout.pipe(res);
-    } else {
-        // Si no hay proceso, enviar error
-        res.status(503).send('No se pudo iniciar el stream');
-        streamClients--;
-        return;
-    }
-
-    // Cuando el cliente se desconecta
+    console.log(`📡 Cliente conectado (${streamClients} totales)`);
+    if (!activeFFmpeg) startFFmpeg();
+    // Cada cliente obtiene su propio PassThrough para no afectar a otros
+    const clientStream = new PassThrough();
+    globalStream.pipe(clientStream, { end: false });
+    clientStream.pipe(res, { end: true });
     req.on('close', () => {
         streamClients--;
         console.log(`📡 Cliente desconectado (${streamClients} restantes)`);
-        // Si no hay más clientes, matar FFmpeg para ahorrar recursos
-        if (streamClients === 0 && currentStreamProcess) {
+        clientStream.unpipe(res);
+        clientStream.destroy();
+        if (streamClients === 0 && activeFFmpeg) {
             console.log('⏹️ Sin clientes, deteniendo FFmpeg...');
-            currentStreamProcess.kill('SIGTERM');
-            currentStreamProcess = null;
+            activeFFmpeg.kill('SIGTERM');
+            activeFFmpeg = null;
         }
     });
 });
@@ -296,39 +222,24 @@ app.get('/health', (req, res) => {
     res.json({
         status: manifestContent ? 'ok' : 'initializing',
         hasToken: !!m3u8Url,
-        lastRenew: lastTokenRenew,
         clients: streamClients,
-        ffmpegRunning: !!currentStreamProcess
+        ffmpegRunning: !!activeFFmpeg
     });
 });
 
-// ========= INICIALIZACIÓN =========
 async function start() {
-    console.log('🚀 Iniciando proxy HLS con stream continuo...');
+    console.log('🚀 Iniciando proxy HLS...');
     await renewToken();
-
-    if (!m3u8Url) {
-        setInterval(async () => { if (!m3u8Url) await renewToken(); }, 10000);
-    }
-
+    if (!m3u8Url) setInterval(async () => { if (!m3u8Url) await renewToken(); }, 10000);
     setInterval(fetchAndRewriteManifest, MANIFEST_REFRESH_SEC * 1000);
     setInterval(renewToken, TOKEN_RENEW_SEC * 1000);
-
     app.listen(PORT, () => {
-        console.log(`\n🚀 Proxy corriendo en http://localhost:${PORT}`);
-        console.log(`📡 Manifiesto: http://localhost:${PORT}/manifest`);
-        console.log(`🎥 Stream continuo: http://localhost:${PORT}/stream`);
-        console.log(`💡 Abre en VLC: http://localhost:${PORT}/stream`);
+        console.log(`\n🚀 Proxy en http://localhost:${PORT}`);
+        console.log(`🎥 Stream: http://localhost:${PORT}/stream`);
     });
 }
 
 start();
 
-process.on('SIGINT', () => {
-    if (currentStreamProcess) currentStreamProcess.kill('SIGTERM');
-    process.exit(0);
-});
-process.on('SIGTERM', () => {
-    if (currentStreamProcess) currentStreamProcess.kill('SIGTERM');
-    process.exit(0);
-});
+process.on('SIGINT', () => { if (activeFFmpeg) activeFFmpeg.kill('SIGTERM'); process.exit(0); });
+process.on('SIGTERM', () => { if (activeFFmpeg) activeFFmpeg.kill('SIGTERM'); process.exit(0); });
