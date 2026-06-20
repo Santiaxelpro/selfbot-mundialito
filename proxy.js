@@ -3,6 +3,7 @@ const express = require('express');
 const axios = require('axios');
 const http = require('http');
 const https = require('https');
+const os = require('os');
 const puppeteer = require('puppeteer-core');
 const chromium = require('@sparticuz/chromium');
 const { spawn } = require('child_process');
@@ -25,6 +26,12 @@ let ffmpegRestartScheduled = false;
 let manifestInterval = null;
 let tokenInterval = null;
 let retryInterval = null;
+let prevCpuTimes = os.cpus().map(c => c.times);
+let lastCpuUsage = 0;
+let cpuSpikeDetected = false;
+let cpuSpikeHistory = [];
+const CPU_SPIKE_THRESHOLD = 80;
+const CPU_SPIKE_WINDOW_MS = 5 * 60 * 1000;
 
 const httpAgent = new http.Agent({
     keepAlive: true,
@@ -430,16 +437,67 @@ app.get('/stream', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
+    res.status(200).send('ok');
+});
+
+function getCpuUsage() {
+    const current = os.cpus().map(c => c.times);
+    let totalDelta = 0;
+    let idleDelta = 0;
+    for (let i = 0; i < current.length; i++) {
+        const prev = prevCpuTimes[i];
+        const cur = current[i];
+        const prevTotal = prev.user + prev.nice + prev.sys + prev.idle + prev.irq;
+        const curTotal = cur.user + cur.nice + cur.sys + cur.idle + cur.irq;
+        totalDelta += curTotal - prevTotal;
+        idleDelta += cur.idle - prev.idle;
+    }
+    prevCpuTimes = current;
+    if (totalDelta === 0) return lastCpuUsage;
+    const usage = Math.round(((totalDelta - idleDelta) / totalDelta) * 100);
+    lastCpuUsage = usage;
+    const now = Date.now();
+    if (usage > CPU_SPIKE_THRESHOLD) {
+        cpuSpikeDetected = true;
+        cpuSpikeHistory.push({ time: now, usage });
+    }
+    cpuSpikeHistory = cpuSpikeHistory.filter(s => now - s.time < CPU_SPIKE_WINDOW_MS);
+    if (cpuSpikeHistory.length === 0) cpuSpikeDetected = false;
+    return usage;
+}
+
+app.get('/status', (req, res) => {
+    const cpuUsage = getCpuUsage();
+    const loadAvg = os.loadavg();
+    const cpuCount = os.cpus().length;
     const mem = process.memoryUsage();
+    const recentSpikes = cpuSpikeHistory.filter(s => Date.now() - s.time < CPU_SPIKE_WINDOW_MS);
+    const overloadRatio = loadAvg[0] / cpuCount;
     res.json({
-        status: manifestContent ? 'ok' : 'initializing',
-        hasToken: !!m3u8Url,
-        clients: activeClients.size,
-        ffmpegRunning: !!activeFFmpeg,
-        browserAlive: browser ? browser.isConnected() : false,
-        memRSS_MB: Math.round(mem.rss / 1024 / 1024),
-        memHeap_MB: Math.round(mem.heapUsed / 1024 / 1024),
-        uptime_s: Math.round(process.uptime()),
+        cpu: {
+            utilization_percent: cpuUsage,
+            cores: cpuCount,
+        },
+        load: {
+            avg_1min: loadAvg[0],
+            avg_5min: loadAvg[1],
+            avg_15min: loadAvg[2],
+            overload: overloadRatio > 0.9,
+            overload_ratio: Math.round(overloadRatio * 100) / 100,
+        },
+        spikes: {
+            detected: cpuSpikeDetected,
+            recent_count: recentSpikes.length,
+            recent_samples: recentSpikes.map(s => ({
+                time: new Date(s.time).toISOString(),
+                usage_percent: s.usage,
+            })),
+        },
+        process: {
+            uptime_s: Math.round(process.uptime()),
+            mem_rss_mb: Math.round(mem.rss / 1024 / 1024),
+            mem_heap_mb: Math.round(mem.heapUsed / 1024 / 1024),
+        },
     });
 });
 
